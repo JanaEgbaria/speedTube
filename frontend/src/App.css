@@ -121,6 +121,13 @@
   transform: scale(0.98);
 }
 
+.stream-status {
+  margin: 0 0 1rem;
+  text-align: center;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
 .error {
   margin: 0 0 1rem;
   padding: 0.65rem 0.9rem;

@@ -2,4 +2,3 @@ fastapi
 uvicorn
 yt-dlp
 python-dotenv
-httpx

@@ -1,19 +1,16 @@
 """
-SpeedTube API: video metadata via yt-dlp and proxied streaming with Range support.
+SpeedTube API: video metadata via yt-dlp and direct CDN URLs for playback.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
 from typing import Any
 
-import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -26,9 +23,6 @@ DEFAULT_CORS_ORIGINS = "http://localhost:5173"
 _cors_raw = os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
 CORS_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
-# Upstream read timeout for long streams (seconds)
-STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT_SECONDS", "300"))
-
 app = FastAPI(title="SpeedTube API")
 
 app.add_middleware(
@@ -39,6 +33,22 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
 )
+
+
+# --- Merged quality presets (label + yt-dlp format selector string) ------------
+
+# Prefer merged video+audio; fall back to best single file at or below that height.
+QUALITY_PRESETS: list[tuple[str, str]] = [
+    ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
+    ("720p", "bestvideo[height<=720]+bestaudio/best[height<=720]"),
+    ("480p", "bestvideo[height<=480]+bestaudio/best[height<=480]"),
+    ("360p", "bestvideo[height<=360]+bestaudio/best[height<=360]"),
+]
+
+
+def merged_format_options() -> list[dict[str, str]]:
+    """Fixed merged-quality options with human labels and yt-dlp format strings."""
+    return [{"label": label, "format": selector} for label, selector in QUALITY_PRESETS]
 
 
 # --- yt-dlp helpers ------------------------------------------------------------
@@ -55,48 +65,13 @@ def _pick_thumbnail(info: dict[str, Any]) -> str | None:
     return best.get("url")
 
 
-def _build_format_options(info: dict[str, Any]) -> list[dict[str, str]]:
-    """
-    Build format choices with human-readable labels and yt-dlp format_id.
-    Prefers muxed video+audio; includes video-only with a clear label if needed.
-    """
-    formats = info.get("formats") or []
-    rows: list[tuple[int, dict[str, str]]] = []
-    seen: set[str] = set()
-
-    for f in formats:
-        fid = f.get("format_id")
-        if not fid or fid in seen:
-            continue
-        if not f.get("url"):
-            continue
-        vcodec = f.get("vcodec")
-        if vcodec in (None, "none"):
-            continue
-
-        height = f.get("height")
-        acodec = f.get("acodec")
-        if acodec in (None, "none"):
-            label = f"{height}p (no audio)" if height else f"{fid} (no audio)"
-        else:
-            label = f"{height}p" if height else (f.get("resolution") or str(fid))
-
-        seen.add(fid)
-        sort_h = height or 0
-        rows.append((sort_h, {"label": label, "format_id": str(fid)}))
-
-    # Highest resolution first
-    rows.sort(key=lambda x: x[0], reverse=True)
-    return [r[1] for r in rows]
-
-
 def _extract_info(url: str, ydl_opts: dict[str, Any]) -> dict[str, Any]:
     with YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 def fetch_video_info(url: str) -> dict[str, Any]:
-    """Extract full info dict (title, thumbnails, duration, formats)."""
+    """Extract full info dict (title, thumbnails, duration)."""
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -105,21 +80,28 @@ def fetch_video_info(url: str) -> dict[str, Any]:
     return _extract_info(url, opts)
 
 
-def resolve_stream_url(url: str, format_id: str) -> str:
-    """Resolve a direct HTTP URL for the requested format_id."""
+def _url_from_info(info: dict[str, Any]) -> str | None:
+    """Single direct HTTP URL for HTML5 video, if yt-dlp exposes one."""
+    if info.get("url"):
+        return str(info["url"])
+    return None
+
+
+def resolve_stream_url(url: str, format_selector: str) -> str:
+    """Resolve a direct CDN URL for the given yt-dlp format selector string."""
     opts: dict[str, Any] = {
-        "format": format_id,
+        "format": format_selector,
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
     }
     info = _extract_info(url, opts)
-    direct = info.get("url")
+    direct = _url_from_info(info)
     if not direct:
         raise ValueError(
-            "No direct URL for this format. It may require merging or a different format_id."
+            "No direct stream URL for this format. Try another quality or a different video."
         )
-    return str(direct)
+    return direct
 
 
 # --- API models ----------------------------------------------------------------
@@ -133,7 +115,14 @@ class VideoInfoResponse(BaseModel):
     title: str
     thumbnail_url: str | None
     duration: float | None
-    formats: list[dict[str, str]]
+    formats: list[dict[str, str]] = Field(
+        ...,
+        description='Each item has "label" (e.g. 1080p) and "format" (yt-dlp selector string)',
+    )
+
+
+class StreamUrlResponse(BaseModel):
+    stream_url: str
 
 
 # --- Routes ---------------------------------------------------------------------
@@ -147,7 +136,7 @@ def health() -> dict[str, str]:
 @app.post("/api/video-info", response_model=VideoInfoResponse)
 async def video_info(body: VideoInfoRequest) -> VideoInfoResponse:
     """
-    Return metadata and playable format options for the given URL.
+    Return metadata and merged quality options (label + format selector string).
     """
     try:
         info = await asyncio.to_thread(fetch_video_info, body.url)
@@ -162,7 +151,7 @@ async def video_info(body: VideoInfoRequest) -> VideoInfoResponse:
     if duration is not None:
         duration = float(duration)
 
-    formats = _build_format_options(info)
+    formats = merged_format_options()
     return VideoInfoResponse(
         title=title,
         thumbnail_url=thumb,
@@ -171,67 +160,24 @@ async def video_info(body: VideoInfoRequest) -> VideoInfoResponse:
     )
 
 
-@app.get("/api/stream")
+@app.get("/api/stream", response_model=StreamUrlResponse)
 async def stream(
-    request: Request,
     url: str = Query(..., description="Original video page URL"),
-    format_id: str = Query(..., description="yt-dlp format id to stream"),
-) -> StreamingResponse:
+    format_selector: str = Query(
+        ...,
+        description="yt-dlp format selector string (same as in video-info)",
+        alias="format",
+    ),
+) -> StreamUrlResponse:
     """
-    Proxy the remote media with support for Range requests (seeking in HTML5 video).
+    Return the final direct CDN URL for this video and format selector.
+    The browser should set the video element's src to this URL (no proxying).
     """
     try:
-        stream_url = await asyncio.to_thread(resolve_stream_url, url, format_id)
+        stream_url = await asyncio.to_thread(resolve_stream_url, url, format_selector)
     except DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    range_header = request.headers.get("range")
-    upstream_headers: dict[str, str] = {}
-    if range_header:
-        upstream_headers["Range"] = range_header
-
-    timeout = httpx.Timeout(STREAM_TIMEOUT, connect=30.0)
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
-
-    try:
-        req = client.build_request("GET", stream_url, headers=upstream_headers)
-        response = await client.send(req, stream=True)
-    except httpx.HTTPError as e:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e
-
-    if response.status_code >= 400:
-        err_body = await response.aread()
-        await response.aclose()
-        await client.aclose()
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream returned {response.status_code}: {err_body[:500]!r}",
-        )
-
-    # Forward range-related headers; force video/mp4 for the player (typical progressive formats).
-    passthrough: dict[str, str] = {
-        "Content-Type": "video/mp4",
-        "Accept-Ranges": response.headers.get("accept-ranges", "bytes"),
-    }
-    if "content-range" in response.headers:
-        passthrough["Content-Range"] = response.headers["content-range"]
-    if "content-length" in response.headers:
-        passthrough["Content-Length"] = response.headers["content-length"]
-
-    async def body() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                yield chunk
-        finally:
-            await response.aclose()
-            await client.aclose()
-
-    return StreamingResponse(
-        body(),
-        status_code=response.status_code,
-        media_type="video/mp4",
-        headers=passthrough,
-    )
+    return StreamUrlResponse(stream_url=stream_url)

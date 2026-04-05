@@ -11,23 +11,67 @@ function App() {
   const [thumbnailUrl, setThumbnailUrl] = useState(null)
   const [formats, setFormats] = useState([])
   const [videoPageUrl, setVideoPageUrl] = useState('')
-  const [selectedFormatId, setSelectedFormatId] = useState('')
+  const [selectedFormat, setSelectedFormat] = useState('')
+  const [streamUrl, setStreamUrl] = useState('')
+  const [streamLoading, setStreamLoading] = useState(false)
+  const [streamError, setStreamError] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [speed, setSpeed] = useState(1)
 
   const videoRef = useRef(null)
 
-  const streamSrc =
-    videoPageUrl && selectedFormatId
-      ? `${API_BASE}/api/stream?url=${encodeURIComponent(videoPageUrl)}&format_id=${encodeURIComponent(selectedFormatId)}`
-      : ''
+  useEffect(() => {
+    if (!videoPageUrl || !selectedFormat) {
+      setStreamUrl('')
+      setStreamError(null)
+      setStreamLoading(false)
+      return
+    }
+
+    let cancelled = false
+    setStreamLoading(true)
+    setStreamError(null)
+    setStreamUrl('')
+
+    ;(async () => {
+      try {
+        const res = await fetch(
+          `${API_BASE}/api/stream?url=${encodeURIComponent(videoPageUrl)}&format=${encodeURIComponent(selectedFormat)}`
+        )
+        const text = await res.text()
+        if (!res.ok) {
+          let detail = text
+          try {
+            const j = JSON.parse(text)
+            detail = j.detail ?? text
+          } catch {
+            /* use raw text */
+          }
+          throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+        }
+        const data = JSON.parse(text)
+        if (!cancelled) setStreamUrl(data.stream_url ?? '')
+      } catch (err) {
+        if (!cancelled) {
+          setStreamUrl('')
+          setStreamError(err.message || 'Failed to resolve stream URL')
+        }
+      } finally {
+        if (!cancelled) setStreamLoading(false)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [videoPageUrl, selectedFormat])
 
   useEffect(() => {
     const v = videoRef.current
-    if (!v || !streamSrc) return
+    if (!v || !streamUrl) return
     v.playbackRate = speed
-  }, [streamSrc, speed])
+  }, [streamUrl, speed])
 
   const onVideoLoaded = () => {
     const v = videoRef.current
@@ -45,7 +89,9 @@ function App() {
     setThumbnailUrl(null)
     setFormats([])
     setVideoPageUrl('')
-    setSelectedFormatId('')
+    setSelectedFormat('')
+    setStreamUrl('')
+    setStreamError(null)
 
     try {
       const res = await fetch(`${API_BASE}/api/video-info`, {
@@ -70,7 +116,7 @@ function App() {
       const fmts = data.formats ?? []
       setFormats(fmts)
       setVideoPageUrl(url)
-      if (fmts.length > 0) setSelectedFormatId(fmts[0].format_id)
+      if (fmts.length > 0) setSelectedFormat(fmts[0].format)
     } catch (err) {
       setError(err.message || 'Failed to load video info')
     } finally {
@@ -82,6 +128,8 @@ function App() {
     setSpeed(rate)
     if (videoRef.current) videoRef.current.playbackRate = rate
   }
+
+  const showPlayerBlock = formats.length > 0 && videoPageUrl && selectedFormat
 
   return (
     <div className="app">
@@ -129,11 +177,11 @@ function App() {
           <select
             id="quality"
             className="quality-select"
-            value={selectedFormatId}
-            onChange={(e) => setSelectedFormatId(e.target.value)}
+            value={selectedFormat}
+            onChange={(e) => setSelectedFormat(e.target.value)}
           >
             {formats.map((f) => (
-              <option key={f.format_id} value={f.format_id}>
+              <option key={f.label} value={f.format}>
                 {f.label}
               </option>
             ))}
@@ -141,7 +189,13 @@ function App() {
         </div>
       )}
 
-      {streamSrc && (
+      {streamLoading && (
+        <p className="stream-status">Resolving direct stream…</p>
+      )}
+
+      {streamError && <p className="error">{streamError}</p>}
+
+      {showPlayerBlock && streamUrl && !streamLoading && (
         <>
           <div className="video-wrap">
             <video
@@ -149,7 +203,7 @@ function App() {
               className="player"
               controls
               playsInline
-              src={streamSrc}
+              src={streamUrl}
               onLoadedData={onVideoLoaded}
             />
           </div>
