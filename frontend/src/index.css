@@ -1,0 +1,13 @@
+/* Minimal base; main UI styles live in App.css */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #0f1117;
+  color-scheme: dark;
+}
