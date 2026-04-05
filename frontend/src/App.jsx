@@ -1,82 +1,83 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const API_BASE = 'http://localhost:8000'
 
-const SPEEDS = [0.25, 0.5, 1, 1.5, 2, 3, 4, 5, 8, 12, 16]
+/** Playback speed up to 5× */
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 5]
+
+function buildStreamFetchUrl(pageUrl) {
+  return `${API_BASE}/api/stream?url=${encodeURIComponent(pageUrl)}`
+}
+
+function formatDuration(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return ''
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
 
 function App() {
   const [urlInput, setUrlInput] = useState('')
   const [title, setTitle] = useState('')
   const [thumbnailUrl, setThumbnailUrl] = useState(null)
-  const [formats, setFormats] = useState([])
-  const [videoPageUrl, setVideoPageUrl] = useState('')
-  const [selectedFormat, setSelectedFormat] = useState('')
-  const [streamUrl, setStreamUrl] = useState('')
-  const [streamLoading, setStreamLoading] = useState(false)
+  const [durationSec, setDurationSec] = useState(null)
+  const [pageUrl, setPageUrl] = useState('')
+  const [playerActive, setPlayerActive] = useState(false)
+  const [loadingStream, setLoadingStream] = useState(false)
   const [streamError, setStreamError] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [speed, setSpeed] = useState(1)
 
-  const videoRef = useRef(null)
+  const audioRef = useRef(null)
 
-  useEffect(() => {
-    if (!videoPageUrl || !selectedFormat) {
-      setStreamUrl('')
-      setStreamError(null)
-      setStreamLoading(false)
+  const fetchStreamAndPlay = useCallback(async () => {
+    if (!pageUrl) return
+
+    const a = audioRef.current
+    if (!a) {
+      setStreamError('Audio element is not ready.')
       return
     }
 
-    let cancelled = false
-    setStreamLoading(true)
+    setLoadingStream(true)
     setStreamError(null)
-    setStreamUrl('')
 
-    ;(async () => {
-      try {
-        const res = await fetch(
-          `${API_BASE}/api/stream?url=${encodeURIComponent(videoPageUrl)}&format=${encodeURIComponent(selectedFormat)}`
-        )
-        const text = await res.text()
-        if (!res.ok) {
-          let detail = text
-          try {
-            const j = JSON.parse(text)
-            detail = j.detail ?? text
-          } catch {
-            /* use raw text */
-          }
-          throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    try {
+      const res = await fetch(buildStreamFetchUrl(pageUrl))
+      const text = await res.text()
+      if (!res.ok) {
+        let detail = text
+        try {
+          const j = JSON.parse(text)
+          detail = j.detail ?? text
+        } catch {
+          /* raw */
         }
-        const data = JSON.parse(text)
-        if (!cancelled) setStreamUrl(data.stream_url ?? '')
-      } catch (err) {
-        if (!cancelled) {
-          setStreamUrl('')
-          setStreamError(err.message || 'Failed to resolve stream URL')
-        }
-      } finally {
-        if (!cancelled) setStreamLoading(false)
+        throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
       }
-    })()
+      const data = JSON.parse(text)
+      const audioUrl = data.audio_url
+      if (!audioUrl) throw new Error('Missing audio_url in response')
 
-    return () => {
-      cancelled = true
+      a.pause()
+      a.src = audioUrl
+      a.playbackRate = speed
+      setPlayerActive(true)
+    } catch (err) {
+      setStreamError(err.message || 'Failed to load audio')
+      setPlayerActive(false)
+    } finally {
+      setLoadingStream(false)
     }
-  }, [videoPageUrl, selectedFormat])
+  }, [pageUrl, speed])
 
   useEffect(() => {
-    const v = videoRef.current
-    if (!v || !streamUrl) return
-    v.playbackRate = speed
-  }, [streamUrl, speed])
-
-  const onVideoLoaded = () => {
-    const v = videoRef.current
-    if (v) v.playbackRate = speed
-  }
+    const a = audioRef.current
+    if (!a || !playerActive) return
+    a.playbackRate = speed
+  }, [playerActive, speed])
 
   const handleLoad = async (e) => {
     e.preventDefault()
@@ -87,11 +88,17 @@ function App() {
     setLoading(true)
     setTitle('')
     setThumbnailUrl(null)
-    setFormats([])
-    setVideoPageUrl('')
-    setSelectedFormat('')
-    setStreamUrl('')
+    setDurationSec(null)
+    setPageUrl('')
+    setPlayerActive(false)
     setStreamError(null)
+
+    const au = audioRef.current
+    if (au) {
+      au.pause()
+      au.src = ''
+      au.removeAttribute('src')
+    }
 
     try {
       const res = await fetch(`${API_BASE}/api/video-info`, {
@@ -113,12 +120,14 @@ function App() {
       const data = JSON.parse(text)
       setTitle(data.title ?? '')
       setThumbnailUrl(data.thumbnail_url ?? null)
-      const fmts = data.formats ?? []
-      setFormats(fmts)
-      setVideoPageUrl(url)
-      if (fmts.length > 0) setSelectedFormat(fmts[0].format)
+      setDurationSec(
+        data.duration != null && Number.isFinite(Number(data.duration))
+          ? Number(data.duration)
+          : null
+      )
+      setPageUrl(url)
     } catch (err) {
-      setError(err.message || 'Failed to load video info')
+      setError(err.message || 'Failed to load info')
     } finally {
       setLoading(false)
     }
@@ -126,104 +135,100 @@ function App() {
 
   const setPlaybackSpeed = (rate) => {
     setSpeed(rate)
-    if (videoRef.current) videoRef.current.playbackRate = rate
+    if (audioRef.current) audioRef.current.playbackRate = rate
   }
 
-  const showPlayerBlock = formats.length > 0 && videoPageUrl && selectedFormat
+  const trackReady = Boolean(pageUrl && title)
 
   return (
     <div className="app">
       <header className="app-header">
         <h1 className="logo">SpeedTube</h1>
-        <p className="tagline">Paste a URL, pick quality, play beyond 2×</p>
+        <p className="tagline">YouTube as audio — up to 5× speed</p>
       </header>
 
       <form className="load-form" onSubmit={handleLoad}>
-        <label className="sr-only" htmlFor="video-url">
+        <label className="sr-only" htmlFor="track-url">
           YouTube URL
         </label>
         <input
-          id="video-url"
+          id="track-url"
           type="url"
           className="url-input"
-          placeholder="https://www.youtube.com/watch?v=…"
+          placeholder="Paste a YouTube URL…"
           value={urlInput}
           onChange={(e) => setUrlInput(e.target.value)}
           autoComplete="off"
         />
         <button type="submit" className="btn btn-primary" disabled={loading}>
-          {loading ? 'Loading…' : 'Load Video'}
+          {loading ? 'Loading…' : 'Load'}
         </button>
       </form>
 
       {error && <p className="error">{error}</p>}
 
-      {title && (
-        <section className="meta">
-          <h2 className="video-title">{title}</h2>
-          {thumbnailUrl && (
-            <img
-              className="thumb"
-              src={thumbnailUrl}
-              alt=""
-            />
+      {trackReady && (
+        <article className="player-card">
+          <div className="album-wrap">
+            {thumbnailUrl ? (
+              <img className="album-art" src={thumbnailUrl} alt="" />
+            ) : (
+              <div className="album-art album-art--placeholder" aria-hidden="true" />
+            )}
+          </div>
+
+          <div className="track-meta">
+            <h2 className="track-title">{title}</h2>
+            {durationSec != null ? (
+              <p className="track-duration">{formatDuration(durationSec)}</p>
+            ) : null}
+          </div>
+
+          <div className="play-row">
+            <button
+              type="button"
+              className="btn btn-primary btn-play"
+              disabled={loadingStream}
+              onClick={fetchStreamAndPlay}
+            >
+              {loadingStream ? 'Loading…' : 'Watch'}
+            </button>
+          </div>
+
+          {loadingStream && (
+            <p className="stream-status">Preparing audio…</p>
           )}
-        </section>
-      )}
 
-      {formats.length > 0 && (
-        <div className="quality-row">
-          <label htmlFor="quality">Quality</label>
-          <select
-            id="quality"
-            className="quality-select"
-            value={selectedFormat}
-            onChange={(e) => setSelectedFormat(e.target.value)}
-          >
-            {formats.map((f) => (
-              <option key={f.label} value={f.format}>
-                {f.label}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
+          {streamError && <p className="error">{streamError}</p>}
 
-      {streamLoading && (
-        <p className="stream-status">Resolving direct stream…</p>
-      )}
-
-      {streamError && <p className="error">{streamError}</p>}
-
-      {showPlayerBlock && streamUrl && !streamLoading && (
-        <>
-          <div className="video-wrap">
-            <video
-              ref={videoRef}
-              className="player"
+          <div className="audio-shell">
+            <audio
+              ref={audioRef}
+              className="audio-player"
               controls
-              playsInline
-              src={streamUrl}
-              onLoadedData={onVideoLoaded}
+              controlsList="nodownload"
+              preload="auto"
             />
           </div>
 
-          <div className="speed-section">
-            <span className="speed-label">Playback speed</span>
-            <div className="speed-buttons">
-              {SPEEDS.map((rate) => (
-                <button
-                  key={rate}
-                  type="button"
-                  className={`btn btn-speed${speed === rate ? ' active' : ''}`}
-                  onClick={() => setPlaybackSpeed(rate)}
-                >
-                  {rate}x
-                </button>
-              ))}
+          {playerActive && (
+            <div className="speed-section">
+              <span className="speed-label">Speed</span>
+              <div className="speed-buttons">
+                {SPEEDS.map((rate) => (
+                  <button
+                    key={rate}
+                    type="button"
+                    className={`btn btn-speed${speed === rate ? ' active' : ''}`}
+                    onClick={() => setPlaybackSpeed(rate)}
+                  >
+                    {rate}x
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
-        </>
+          )}
+        </article>
       )}
     </div>
   )
